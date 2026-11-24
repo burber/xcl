@@ -9,10 +9,8 @@
 //! has room: every inline write becomes the method call, and each method runs on the
 //! (adopted) PC list behind it – with all of XCL's console slot handling.
 //!
-//! The object: the console fields, the PC list at `F_BACKING`; its vtable is a thunk per slot
-//! (`mov rcx, [rcx + F_BACKING]` and on to the PC list's own vtable entry). QueryInterface
-//! hands out the console object again, Release frees it with the PC list, and
-//! ExecuteCommandLists runs the PC lists (`backing`).
+//! Object and IUnknown methods use a stable PC list. Recording methods use the active PC list;
+//! a progress wait can close that list and start a continuation without changing COM identity.
 
 use std::ffi::c_void;
 use std::sync::OnceLock;
@@ -22,10 +20,11 @@ use windows_sys::core::GUID;
 use crate::util::HRESULT;
 
 const LIST_SLOTS: usize = 600;
-/// the object: console fields up to `ROOM`, no-room "buffer" at `ROOM` (with slack after it
-/// for code that would write before checking), the PC list at `F_BACKING`
+/// Console fields up to `ROOM`, a no-room "buffer" with slack, then XCL's private fields.
 const OBJECT_BYTES: usize = 0x3000;
 const ROOM: usize = 0x1000;
+const F_RECORDING: usize = 0x2F80;
+const F_ACTIVE: usize = 0x2FF0;
 const F_BACKING: usize = 0x2FF8;
 const F_WRITE: usize = 0x18;
 const F_DISPATCH_END: usize = 0x28;
@@ -37,15 +36,50 @@ const RING: usize = 64;
 
 struct Vtable(usize);
 
-/// The console list vtable: QueryInterface / Release of their own, every other slot a thunk
-/// to the PC list's entry.
+#[derive(Default)]
+struct Recording {
+    prefixes: Vec<*mut c_void>,
+    kicked: usize,
+    closed: bool,
+    error: HRESULT,
+    // State not kept by KickoffX restoration: bundle, raw predication, stream out, VRS.
+    untracked: bool,
+}
+
+unsafe fn recording(this: *mut c_void) -> *mut Recording {
+    this.cast::<u8>().add(F_RECORDING).cast()
+}
+
+unsafe fn root(this: *mut c_void) -> *mut c_void {
+    *this.cast::<u8>().add(F_BACKING).cast()
+}
+
+pub(super) unsafe fn active(this: *mut c_void) -> *mut c_void {
+    *this.cast::<u8>().add(F_ACTIVE).cast()
+}
+
+fn backing_field(slot: usize) -> usize {
+    if slot < 9 { F_BACKING } else { F_ACTIVE }
+}
+
+fn changes_untracked_state(slot: usize) -> bool {
+    matches!(slot, 27 | 31 | 49 | 124 | 125)
+}
+
+/// The console list vtable, with identity and Close methods of its own.
 fn vtable() -> usize {
     static V: OnceLock<Vtable> = OnceLock::new();
     V.get_or_init(|| {
         let mut v = vec![0usize; LIST_SLOTS];
         let trace = std::env::var_os("XCL_LIST_TRACE").is_some();
         for (slot, e) in v.iter_mut().enumerate() {
-            *e = if trace { forward_traced(slot) } else { forward(slot) };
+            *e = if trace {
+                forward_traced(slot, record)
+            } else if changes_untracked_state(slot) {
+                forward_traced(slot, block_split)
+            } else {
+                forward(slot)
+            };
         }
         v[0] = qi as usize;
         v[2] = release as usize;
@@ -55,10 +89,10 @@ fn vtable() -> usize {
     .0
 }
 
-/// `mov rcx, [rcx + F_BACKING]; mov rax, [rcx]; jmp [rax + slot * 8]`
+/// `mov rcx, [rcx + field]; mov rax, [rcx]; jmp [rax + slot * 8]`
 fn forward(slot: usize) -> usize {
     let mut c = vec![0x48, 0x8B, 0x89];
-    c.extend_from_slice(&(F_BACKING as u32).to_le_bytes());
+    c.extend_from_slice(&(backing_field(slot) as u32).to_le_bytes());
     c.extend_from_slice(&[0x48, 0x8B, 0x01, 0xFF, 0xA0]);
     c.extend_from_slice(&((slot * 8) as u32).to_le_bytes());
     let p = crate::stubs::alloc_code(c.len());
@@ -68,8 +102,8 @@ fn forward(slot: usize) -> usize {
     p as usize
 }
 
-/// `forward` after `record(this, slot)` (argument registers, xmm0–3 kept)
-fn forward_traced(slot: usize) -> usize {
+/// `forward` after calling `hook(this, slot)` (argument registers, xmm0–3 kept).
+fn forward_traced(slot: usize, hook: unsafe extern "system" fn(*mut c_void, u32)) -> usize {
     let mut c: Vec<u8> = vec![0x51, 0x52, 0x41, 0x50, 0x41, 0x51]; // push rcx, rdx, r8, r9
     c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x68]); // sub rsp, 0x68
     for (reg, off) in [(0x44u8, 0x20u8), (0x4C, 0x30), (0x54, 0x40), (0x5C, 0x50)] {
@@ -77,8 +111,8 @@ fn forward_traced(slot: usize) -> usize {
     }
     c.push(0xBA); // mov edx, slot
     c.extend_from_slice(&(slot as u32).to_le_bytes());
-    c.extend_from_slice(&[0x48, 0xB8]); // mov rax, record
-    c.extend_from_slice(&(record as usize as u64).to_le_bytes());
+    c.extend_from_slice(&[0x48, 0xB8]); // mov rax, hook
+    c.extend_from_slice(&(hook as usize as u64).to_le_bytes());
     c.extend_from_slice(&[0xFF, 0xD0]); // call rax
     for (reg, off) in [(0x44u8, 0x20u8), (0x4C, 0x30), (0x54, 0x40), (0x5C, 0x50)] {
         c.extend_from_slice(&[0xF3, 0x0F, 0x6F, reg, 0x24, off]); // movdqu xmmN, [rsp+off]
@@ -86,7 +120,7 @@ fn forward_traced(slot: usize) -> usize {
     c.extend_from_slice(&[0x48, 0x83, 0xC4, 0x68]); // add rsp, 0x68
     c.extend_from_slice(&[0x41, 0x59, 0x41, 0x58, 0x5A, 0x59]); // pop r9, r8, rdx, rcx
     c.extend_from_slice(&[0x48, 0x8B, 0x89]);
-    c.extend_from_slice(&(F_BACKING as u32).to_le_bytes());
+    c.extend_from_slice(&(backing_field(slot) as u32).to_le_bytes());
     c.extend_from_slice(&[0x48, 0x8B, 0x01, 0xFF, 0xA0]);
     c.extend_from_slice(&((slot * 8) as u32).to_le_bytes());
     let p = crate::stubs::alloc_code(c.len());
@@ -97,17 +131,97 @@ fn forward_traced(slot: usize) -> usize {
 }
 
 unsafe extern "system" fn record(this: *mut c_void, slot: u32) {
+    if changes_untracked_state(slot as usize) {
+        block_split(this, slot);
+    }
     let at = (this as usize + F_RING_AT) as *mut usize;
     let k = *at % RING;
     *((this as usize + F_RING + 2 * k) as *mut u16) = slot as u16;
     *at += 1;
 }
 
+unsafe extern "system" fn block_split(this: *mut c_void, _slot: u32) {
+    (*recording(this)).untracked = true;
+}
+
+pub(super) unsafe fn can_split(this: *mut c_void) -> bool {
+    let r = &*recording(this);
+    !r.closed && r.error >= 0 && !r.untracked
+}
+
+pub(super) unsafe fn split_error(this: *mut c_void, hr: HRESULT) {
+    (*recording(this)).error = hr;
+}
+
+/// Keep the old PC list alive and start routing recording calls to `next`.
+pub(super) unsafe fn continue_on(this: *mut c_void, next: *mut c_void) {
+    (*recording(this)).prefixes.push(active(this));
+    *this.cast::<u8>().add(F_ACTIVE).cast() = next;
+}
+
+/// For explicit KickoffX: flush newly closed prefixes, but keep the PC objects until Reset.
+pub(super) unsafe fn take_kickoff(this: *mut c_void) -> Vec<*mut c_void> {
+    let r = &mut *recording(this);
+    let lists = r.prefixes[r.kicked..].to_vec();
+    r.kicked = r.prefixes.len();
+    lists
+}
+
+pub(super) unsafe fn has_prefixes(this: *mut c_void) -> bool {
+    let r = &*recording(this);
+    r.kicked < r.prefixes.len()
+}
+
+/// Expand a wrapped recording at Execute, not at a recording-side wait.
+pub(super) unsafe fn append_pieces(this: *mut c_void, out: &mut Vec<*mut c_void>) -> Result<(), HRESULT> {
+    let r = &*recording(this);
+    if r.error < 0 {
+        return Err(r.error);
+    }
+    if has_prefixes(this) {
+        if !r.closed {
+            return Err(crate::util::E_INVALIDARG);
+        }
+        out.extend_from_slice(&r.prefixes[r.kicked..]);
+    }
+    out.push(active(this));
+    Ok(())
+}
+
+/// Only a successful native Reset discards the preceding PC recordings.
+pub(super) unsafe fn on_reset(this: *mut c_void) {
+    let r = &mut *recording(this);
+    let pc = root(this);
+    for prefix in r.prefixes.drain(..) {
+        if prefix == pc {
+            super::list_x::on_release(pc as usize);
+            super::bind::forget(pc);
+        } else {
+            release_pc(prefix);
+        }
+    }
+    r.kicked = 0;
+    r.closed = false;
+    r.error = 0;
+    r.untracked = false;
+}
+
 /// #9 Close: a failure is logged with the last methods called (`XCL_LIST_TRACE`)
 unsafe extern "system" fn close(this: *mut c_void) -> HRESULT {
-    let pc = *((this as usize + F_BACKING) as *const *mut c_void);
-    let f: unsafe extern "system" fn(*mut c_void) -> HRESULT = std::mem::transmute(pc_slot(pc, 9));
-    let hr = f(pc);
+    let r = recording(this);
+    let pc = active(this);
+    let hr = if (*r).error < 0 {
+        (*r).error
+    } else {
+        let f: unsafe extern "system" fn(*mut c_void) -> HRESULT = std::mem::transmute(pc_slot(pc, 9));
+        let hr = f(pc);
+        if hr >= 0 {
+            (*r).closed = true;
+        } else if !(*r).closed && has_prefixes(this) {
+            (*r).error = hr;
+        }
+        hr
+    };
     let n = *((this as usize + F_RING_AT) as *const usize);
     if hr < 0 && n > 0 {
         let first = n.saturating_sub(RING);
@@ -134,16 +248,20 @@ pub unsafe fn wrap(pc: *mut c_void) -> *mut c_void {
     for f in [F_WRITE, F_DISPATCH_END, F_END] {
         *(o.add(f) as *mut usize) = room;
     }
-    *(o.add(F_BACKING) as *mut usize) = pc as usize;
+    let this = o.cast();
+    recording(this).write(Recording::default());
+    *o.add(F_BACKING).cast() = pc;
+    *o.add(F_ACTIVE).cast() = pc;
+    super::list_x::set_title_owner(pc, this);
     o as *mut c_void
 }
 
-/// The PC list behind a console list object (None: not one).
+/// The stable PC identity of a console list object (None: not one).
 pub fn backing(list: *mut c_void) -> Option<*mut c_void> {
     if list.is_null() || !crate::gpu::shader::readable(list as usize, 8) {
         return None;
     }
-    unsafe { (*(list as *const usize) == vtable()).then(|| *((list as usize + F_BACKING) as *const *mut c_void)) }
+    unsafe { (*(list as *const usize) == vtable()).then(|| root(list)) }
 }
 
 unsafe fn pc_slot(pc: *mut c_void, slot: usize) -> usize {
@@ -161,7 +279,7 @@ const CONSOLE_LIST_IIDS: [(u32, u16, u16, [u8; 8]); 2] = [
 ];
 
 unsafe extern "system" fn qi(this: *mut c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    let pc = *((this as usize + F_BACKING) as *const *mut c_void);
+    let pc = root(this);
     let f: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(pc_slot(pc, 0));
     if !riid.is_null() && !ppv.is_null() {
         let g = &*riid;
@@ -179,13 +297,27 @@ unsafe extern "system" fn qi(this: *mut c_void, riid: *const GUID, ppv: *mut *mu
     hr
 }
 
-/// Release: the console object goes with the PC list's last reference.
-unsafe extern "system" fn release(this: *mut c_void) -> u32 {
-    let pc = *((this as usize + F_BACKING) as *const *mut c_void);
+unsafe fn release_pc(pc: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(pc_slot(pc, 2));
-    let n = f(pc);
+    f(pc)
+}
+
+/// Release: the console object goes with the stable PC list's last reference.
+unsafe extern "system" fn release(this: *mut c_void) -> u32 {
+    let pc = root(this);
+    let n = release_pc(pc);
     if n == 0 {
         super::bind::forget(pc);
+        let r = recording(this).read();
+        for prefix in r.prefixes {
+            if prefix != pc {
+                release_pc(prefix);
+            }
+        }
+        let last = active(this);
+        if last != pc {
+            release_pc(last);
+        }
         std::alloc::dealloc(this as *mut u8, std::alloc::Layout::from_size_align(OBJECT_BYTES, 64).unwrap());
     }
     n

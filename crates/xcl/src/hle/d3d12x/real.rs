@@ -4811,6 +4811,7 @@ unsafe extern "system" fn q_release(this: *mut c_void) -> u32 {
     let n = f(this);
     if n == 0 {
         super::list_x::on_queue_release(this as usize);
+        super::cpu_writes::forget_queue(this as usize);
     }
     n
 }
@@ -5022,21 +5023,25 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         stop_if_device_removed();
         return;
     }
+    // A wrapped list can contain closed prefixes separated by recorded progress waits.
+    // Expand all lists before executing any of them, so an invalid Close cannot submit a prefix.
+    let mut mapped = Vec::with_capacity(n as usize);
+    for &list in std::slice::from_raw_parts(lists, n as usize) {
+        if let Some(pc) = super::console_list::pc_list(list) {
+            mapped.push(pc);
+        } else if super::title_list::backing(list).is_some() {
+            if let Err(hr) = super::title_list::append_pieces(list, &mut mapped) {
+                super::list_x::fail_submission(format!("command list {list:p} has an invalid recording ({hr:#x})"));
+            }
+        } else {
+            mapped.push(list);
+        }
+    }
     // textures in title memory the CPU wrote since: uploaded again first
     super::title_textures::refresh(this);
-    // console-shaped lists run as the PC lists they were translated into
-    let mapped: Vec<*mut c_void> = std::slice::from_raw_parts(lists, n as usize)
-        .iter()
-        .map(|&l| super::console_list::pc_list(l).or_else(|| super::title_list::backing(l)).unwrap_or(l))
-        .collect();
-    super::list_x::note_queue_for_lists(this as usize, &mapped);
-    super::list_x::execute_with_waits(&mapped, |chunk| {
-        f(this, chunk.len() as u32, chunk.as_ptr());
-        super::list_x::readback_sparse_writes(this, chunk);
-        super::list_x::cpu_writes_after(this, chunk);
-    });
-    // the next uploads into textures kept in step start from the states these lists leave
-    super::title_textures::submitted(&mapped);
+    if let Err(reason) = super::list_x::execute_with_waits(this, &mapped, |chunk| super::list_x::submit_piece(this, chunk, f)) {
+        super::list_x::fail_submission(reason);
+    }
     super::present::note_execute(this, &mapped);
     stop_if_device_removed();
 }

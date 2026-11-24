@@ -87,6 +87,17 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
     console_list::hold_until_reset(old, blocks);
 }
 
+/// Continue on a distinct PC list using the same allocator and root arguments. The arena
+/// moves with the recording; previously recorded commands still reference its allocations.
+pub(super) fn continue_recording(from: *mut c_void, to: *mut c_void) {
+    let mut states = STATES.lock().unwrap();
+    if let Some(m) = states.as_mut() {
+        if let Some(s) = m.remove(&(from as usize)) {
+            m.insert(to as usize, s);
+        }
+    }
+}
+
 /// `ClearState(pso)`: resets pipeline and root-argument state back to creation defaults
 /// with `pso` bound, keeping the current recording's allocator and UMA arena intact.
 pub(super) fn clear_state(list: *mut c_void, pso: usize) {
