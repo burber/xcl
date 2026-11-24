@@ -21,6 +21,8 @@ struct Pending {
     done: Mutex<bool>,
     cv: Condvar,
     compute: bool,
+    /// a bounded compute wait already timed out; subsequent binds skip waiting until `real` lands
+    timed_out: std::sync::atomic::AtomicBool,
     /// the stand-in was released before the real pipeline was built
     orphan: std::sync::atomic::AtomicBool,
 }
@@ -118,6 +120,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool) {
         done: Mutex::new(false),
         cv: Condvar::new(),
         compute,
+        timed_out: Default::default(),
         orphan: Default::default(),
     });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
@@ -167,11 +170,88 @@ pub fn resolve_wait(pso: usize) -> usize {
     }
 }
 
-/// For binding: compute pipelines are waited for, graphics ones are not.
+/// Maximum time a title thread waits for a compute pipeline on its first bind/dispatch
+/// (`XCL_COMPUTE_PSO_WAIT_MS`, default 4000 ms; `0` = unbounded). Huge compute shaders can take
+/// 20+ s to compile in DXC / the driver, which trips a retail title's render-thread watchdog.
+fn compute_wait_timeout() -> Option<std::time::Duration> {
+    static LIMIT: OnceLock<Option<std::time::Duration>> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let ms = std::env::var("XCL_COMPUTE_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(4000);
+        if ms == 0 { None } else { Some(std::time::Duration::from_millis(ms)) }
+    })
+}
+
+/// Bounded wait for a compute pipeline: always builds on `xcl-pso-*` workers (never stalling the
+/// title's thread inside DXC/driver), waits at most `limit` on the first bind/dispatch, and
+/// returns the stand-in immediately on subsequent calls until the worker finishes.
+fn resolve_compute_within(pso: usize, limit: Option<std::time::Duration>) -> usize {
+    let Some(limit) = limit else {
+        return resolve_wait(pso);
+    };
+    let Some(p) = entry(pso) else { return pso };
+    if let r @ 1.. = p.real.load(Ordering::Acquire) {
+        return r;
+    }
+    if !p.sent.swap(true, Ordering::AcqRel) {
+        let _ = queue().lock().unwrap().send(p.clone());
+    }
+    if p.timed_out.load(Ordering::Acquire) {
+        return match p.real.load(Ordering::Acquire) {
+            0 => pso,
+            r => r,
+        };
+    }
+    let deadline = std::time::Instant::now() + limit;
+    let mut done = p.done.lock().unwrap();
+    while !*done {
+        let rem = deadline.saturating_duration_since(std::time::Instant::now());
+        if rem.is_zero() {
+            break;
+        }
+        let (g, res) = p.cv.wait_timeout(done, rem).unwrap();
+        done = g;
+        if res.timed_out() {
+            break;
+        }
+    }
+    if !*done {
+        if !p.timed_out.swap(true, Ordering::AcqRel) {
+            static LOGGED: AtomicUsize = AtomicUsize::new(0);
+            if LOGGED.fetch_add(1, Ordering::Relaxed) < 16 {
+                crate::xlog_warn!(
+                    "D3D12.X: compute pipeline {pso:#x} still building after {} ms – proceeding with stand-in (continues in background)",
+                    limit.as_millis()
+                );
+            }
+        }
+        return pso;
+    }
+    match p.real.load(Ordering::Acquire) {
+        0 => pso,
+        r => r,
+    }
+}
+
+/// Resolve a compute pipeline with `XCL_COMPUTE_PSO_WAIT_MS` bounding.
+pub fn resolve_compute(pso: usize) -> usize {
+    resolve_compute_within(pso, compute_wait_timeout())
+}
+
+/// For binding: compute pipelines wait up to `XCL_COMPUTE_PSO_WAIT_MS` on background workers;
+/// graphics pipelines are queued without blocking.
 pub fn resolve_for_bind(pso: usize) -> usize {
     match entry(pso) {
-        Some(p) if p.compute => resolve_wait(pso),
+        Some(p) if p.compute => resolve_compute(pso),
         Some(_) => resolve(pso),
+        None => pso,
+    }
+}
+
+/// For `ExecuteIndirect`: compute pipelines use bounded waits, graphics pipelines keep `resolve_wait`.
+pub fn resolve_for_indirect(pso: usize) -> usize {
+    match entry(pso) {
+        Some(p) if p.compute => resolve_compute(pso),
+        Some(_) => resolve_wait(pso),
         None => pso,
     }
 }
@@ -200,4 +280,53 @@ pub fn is_pending(pso: usize) -> bool {
 pub fn counts() -> (usize, usize, usize) {
     let pending = PENDING.lock().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| !*p.done.lock().unwrap()).count());
     (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), pending)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn bounded_compute_wait_times_out_then_resolves_once_worker_finishes() {
+        let standin = 0x7300_0001usize;
+        let real_pso = 0x7300_0002usize;
+        let (tx, rx) = mpsc::channel::<()>();
+        submit_lazy(
+            standin,
+            true,
+            Box::new(move || {
+                let _ = rx.recv_timeout(Duration::from_secs(5));
+                real_pso
+            }),
+        );
+
+        // First call sends the lazy build to the worker pool and returns the stand-in after ~limit.
+        let t0 = Instant::now();
+        assert_eq!(resolve_compute_within(standin, Some(Duration::from_millis(60))), standin);
+        assert!(t0.elapsed() < Duration::from_secs(1), "bounded wait must not block indefinitely");
+
+        // Subsequent calls while still building return immediately (no repeated timeout stall).
+        let t1 = Instant::now();
+        assert_eq!(resolve_compute_within(standin, Some(Duration::from_secs(2))), standin);
+        assert!(t1.elapsed() < Duration::from_millis(200), "post-timeout calls must return immediately");
+
+        // Unblock the background worker; once complete, resolution immediately returns the real PSO.
+        tx.send(()).unwrap();
+        let wait = Instant::now();
+        while resolve_compute_within(standin, Some(Duration::from_millis(50))) != real_pso {
+            assert!(wait.elapsed() < Duration::from_secs(5), "background compute PSO never completed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(released(standin), real_pso);
+    }
+
+    #[test]
+    fn bounded_compute_wait_returns_real_when_build_finishes_in_time() {
+        let standin = 0x7300_0003usize;
+        let real_pso = 0x7300_0004usize;
+        submit_lazy(standin, true, Box::new(move || real_pso));
+        assert_eq!(resolve_compute_within(standin, Some(Duration::from_secs(4))), real_pso);
+        assert_eq!(released(standin), real_pso);
+    }
 }
