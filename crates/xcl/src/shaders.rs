@@ -715,7 +715,8 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     if args.iter().any(|a| a == "--precompile") {
         let only = args.iter().position(|a| a == "--only").and_then(|i| args.get(i + 1)).map(|s| s.to_ascii_lowercase());
         let pipelines = args.iter().any(|a| a == "--pipelines").then(|| opt("--pipeline-min-kb").unwrap_or(0) << 10);
-        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), opt("--windows").unwrap_or(4) as u32, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, t0);
+        let used_only = args.iter().any(|a| a == "--used-only");
+        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), opt("--windows").unwrap_or(4) as u32, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, used_only, t0);
     }
     let agg = analyze(&input, recomp_on, compile, iface_on);
     drop(input);
@@ -858,7 +859,25 @@ impl Pipelines {
     }
 }
 
-fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: Option<usize>, t0: std::time::Instant) -> i32 {
+/// The compute programs a title's pipelines used in earlier runs (`used-pipelines.txt` of the DXIL
+/// cache, written by `pso_async::used`): a compute pipeline's key is `shaders_key` of its one CS.
+fn used_compute_keys() -> std::collections::HashSet<u64> {
+    let text = std::fs::read_to_string(recomp::dxc::cache_dir().join("used-pipelines.txt")).unwrap_or_default();
+    text.lines().filter_map(|l| u64::from_str_radix(l.trim(), 16).ok()).collect()
+}
+
+/// `real::shaders_key` of a pipeline with the one shader `blob`.
+fn compute_pipeline_key(blob: &[u8]) -> u64 {
+    ((0xcbf2_9ce4_8422_2325u64 ^ crate::gpu::shader::fnv64(blob)).wrapping_mul(0x0000_0100_0000_01b3)) | 1
+}
+
+fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: Option<usize>, used_only: bool, t0: std::time::Instant) -> i32 {
+    // `--used-only`: only the compute programs a title used in an earlier run (the rest of a pack
+    // can hold programs a title never makes – one of a retail pack's took DXC past 40 GB)
+    let used = used_only.then(used_compute_keys);
+    if let Some(u) = &used {
+        println!("--used-only: {} pipelines an earlier run used", u.len());
+    }
     let pipelines = if let Some(min_dxil) = pipelines {
         match Pipelines::new(min_dxil) {
             Ok(p) => Some(p),
@@ -906,6 +925,11 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
                 // a compute program as a title's pipeline translates it (`pso::console_to_dxil_in`):
                 // into the translation cache too, so the title does not translate it again
                 if sh.fssm.iter().any(|f| matches!(recomp::interface(&blob, &sh, f), Some(recomp::Mode::Compute(_)))) {
+                    if used.as_ref().is_some_and(|u| !u.contains(&compute_pipeline_key(&blob))) {
+                        skipped.fetch_add(1, Ordering::Relaxed);
+                        done.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                     match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
                         Ok(c) => {
                             if let Some(p) = pipelines {
