@@ -487,14 +487,22 @@ pub fn init() -> Result<String, String> {
         }
         // `XCL_DRED=1`: on a device removal the faulting address and the last GPU operations
         // (logged by `log_device_removed`); no debug layer needed. Opt-in: with it XDefiant
-        // stalled in its first seconds twice.
-        if std::env::var_os("XCL_DRED").is_some() {
+        // stalled in its first seconds twice, and a newer retail title froze at 16 s on NVIDIA.
+        // `XCL_DRED=breadcrumbs` / `pagefault`: one of the two only.
+        if let Some(mode) = std::env::var("XCL_DRED").ok().map(|v| v.trim().to_ascii_lowercase()) {
+            let (crumbs, faults) = match mode.as_str() {
+                "breadcrumbs" => (true, false),
+                "pagefault" | "pagefaults" => (false, true),
+                _ => (true, true),
+            };
+            let on = |b: bool| if b { D3D12_DRED_ENABLEMENT_FORCED_ON } else { D3D12_DRED_ENABLEMENT_FORCED_OFF };
             match crate::gpu::agility::configuration_interface::<ID3D12DeviceRemovedExtendedDataSettings>(
                 &CLSID_D3D12DeviceRemovedExtendedData,
             ) {
                 Ok(d) => {
-                    d.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-                    d.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                    d.SetAutoBreadcrumbsEnablement(on(crumbs));
+                    d.SetPageFaultEnablement(on(faults));
+                    crate::xlog_info!("D3D12: DRED on (breadcrumbs {crumbs}, page faults {faults})");
                 }
                 Err(e) => {
                     crate::xlog_warn!("D3D12: DRED requested but unavailable: {e}");
