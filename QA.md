@@ -25,8 +25,15 @@ DXIL cache filled beforehand with `xcl shaders --precompile` (22 800 / 26 503 pr
 | 13 | `exp/wait-order` (`08c4eb7` + #708) | 102 s | as 6 | world loading from ~85 s | 30 → 0 | **0 `Wait64BitValueX` timeouts**; null writes at 90.6 s (`vcruntime140+0x14d3` write 0x20, then two more) ~2.5 s after the first `#101`; VRAM 14.6 GB |
 | 14 | same | 120 s | as 6 | world loading from ~85 s | 30 → 0 | **0 `Wait64` timeouts** again; watchdog `+0x23cf683` at 116 s; VRAM 14.2 GB, target pages 9.7 GB. Run 13's null writes did not repeat |
 
-#708 removes the never-written-counter waits on this machine in both runs (run 12 had them). What is
-left here is the world-loading stall with local video memory ~2 GB past the 12 GB card (#560 / #320).
+| 15 | `exp/page-budget` (#708 + #640), `XCL_PAGE_BUDGET_MB=6144` | 130 s | as 6 | world loading from ~80 s | 30 → 0 | **video memory 10.3 GB (under the card)**, target pages 5.5 GB, 7 316 textures evicted, 42 mapped again; 0 `Wait64` timeouts; watchdog at 127 s with 10 compute pipelines "still building after 4000 ms" from 101 s |
+| 16 | same | 132 s | as 6 | world loading from ~75 s | 30 → 0 | 546 shader sets built ahead (run 15: 525); 13 compute pipelines still building at ~103 s; VRAM 10.4 GB; watchdog at 129 s |
+
+#708 removes the never-written-counter waits on this machine (runs 13–16; run 12 had them), and #640's
+budget keeps video memory under the 12 GB card (runs 15–16). What is left on an RTX 4070 Ti is the
+first build of the world's large compute pipelines: #690 builds a pipeline ahead only once the title
+creates it, which here is seconds before its first use, and the slowest take the NVIDIA driver longer
+than the title's ~25 s stall allowance, so they never finish, never reach the driver cache (#634), and
+the same ones stall every run.
 
 Series S profile (runs 8–9): at the menus video memory is 7.3 GB with 1.9 GB of target pages
 (Series X: ~6 GB / ~5 GB later), but the title asserts at `+0xb18de7` right after the account
