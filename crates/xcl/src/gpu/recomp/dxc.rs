@@ -535,10 +535,12 @@ fn toolchain_identity() -> &'static str {
     })
 }
 
-/// FNV-1a 64 of the inputs that determine the DXIL.
-fn cache_key_for_toolchain(src: &str, entry: &str, profile: &str, toolchain: &str) -> u64 {
+/// FNV-1a 64 of the inputs that determine the DXIL: the DXC arguments too, after the source,
+/// so a compile without any keeps the key it always had (existing cache entries still hit).
+/// Each part ends in a NUL: two arguments never hash like one argument with a space.
+fn cache_key_for_toolchain(src: &str, entry: &str, profile: &str, extra: &[&str], toolchain: &str) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for part in [env!("CARGO_PKG_VERSION"), toolchain, profile, entry, src] {
+    for part in [env!("CARGO_PKG_VERSION"), toolchain, profile, entry, src].into_iter().chain(extra.iter().copied()) {
         for b in part.bytes().chain([0u8]) {
             h ^= b as u64;
             h = h.wrapping_mul(0x100_0000_01b3);
@@ -548,7 +550,18 @@ fn cache_key_for_toolchain(src: &str, entry: &str, profile: &str, toolchain: &st
 }
 
 fn cache_key(src: &str, entry: &str, profile: &str) -> u64 {
-    cache_key_for_toolchain(src, entry, profile, toolchain_identity())
+    cache_key_with(src, entry, profile, &[])
+}
+
+fn cache_key_with(src: &str, entry: &str, profile: &str, extra: &[&str]) -> u64 {
+    cache_key_for_toolchain(src, entry, profile, extra, toolchain_identity())
+}
+
+/// `XCL_DXC_ARGS="-O1 …"`: extra DXC arguments for every compile through the disk cache
+/// (comparing optimisation levels); part of the cache key, so changing them recompiles.
+fn env_dxc_args() -> &'static [String] {
+    static ARGS: OnceLock<Vec<String>> = OnceLock::new();
+    ARGS.get_or_init(|| std::env::var("XCL_DXC_ARGS").unwrap_or_default().split_whitespace().map(str::to_string).collect())
 }
 
 /// Folder of the DXIL cache: `XCL_DXIL_CACHE`, else `%LOCALAPPDATA%\xcl\dxil`.
@@ -629,7 +642,14 @@ pub(super) fn note_memory_hit() {
 /// `compile` through a disk cache in `dir` (big translated programs take seconds in DXC;
 /// the same console shader comes back every run). Returns (DXIL, from cache).
 pub fn compile_cached_in(dir: &Path, src: &str, entry: &str, profile: &str) -> Result<(Vec<u8>, bool), String> {
-    compile_cached_in_with(dir, src, entry, profile, || compile(src, entry, profile, &[]))
+    let extra: Vec<&str> = env_dxc_args().iter().map(String::as_str).collect();
+    compile_cached_args(dir, src, entry, profile, &extra)
+}
+
+/// `compile_cached_in` with explicit DXC arguments: they are part of the key, so a different
+/// list compiles again instead of answering with DXIL made under other arguments.
+pub fn compile_cached_args(dir: &Path, src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<(Vec<u8>, bool), String> {
+    compile_cached_in_observed(dir, src, entry, profile, extra, cache_counters(), || compile(src, entry, profile, extra))
 }
 
 type CacheFlight = (PathBuf, u64);
@@ -757,7 +777,7 @@ fn compile_cached_in_with<F>(dir: &Path, src: &str, entry: &str, profile: &str, 
 where
     F: FnOnce() -> Result<Vec<u8>, String>,
 {
-    compile_cached_in_observed(dir, src, entry, profile, cache_counters(), compile_one)
+    compile_cached_in_observed(dir, src, entry, profile, &[], cache_counters(), compile_one)
 }
 
 fn compile_cached_in_observed<F>(
@@ -765,13 +785,14 @@ fn compile_cached_in_observed<F>(
     src: &str,
     entry: &str,
     profile: &str,
+    extra: &[&str],
     counters: &CacheCounters,
     compile_one: F,
 ) -> Result<(Vec<u8>, bool), String>
 where
     F: FnOnce() -> Result<Vec<u8>, String>,
 {
-    let key = cache_key(src, entry, profile);
+    let key = cache_key_with(src, entry, profile, extra);
     let dir = normalized_cache_dir(dir);
     let file = dir.join(format!("{key:016x}.dxil"));
     if let Some(b) = cached_file(&file) {
@@ -915,7 +936,7 @@ mod cache_tests {
         let counters = CacheCounters::default();
         let src = "cache diagnostics";
         let request = |compile_one: fn() -> Result<Vec<u8>, String>| {
-            compile_cached_in_observed(&dir, src, "shade", "ps_6_6", &counters, compile_one)
+            compile_cached_in_observed(&dir, src, "shade", "ps_6_6", &[], &counters, compile_one)
         };
 
         let (r, missed) = cached_only(|| request(|| panic!("a cached-only miss must not compile")));
@@ -1003,11 +1024,37 @@ mod cache_tests {
     }
 
     #[test]
+    fn cache_key_tracks_the_dxc_arguments() {
+        let a = cache_key_with("source", "main", "cs_6_6", &[]);
+        assert_eq!(a, cache_key("source", "main", "cs_6_6"), "no arguments: the key it always had");
+        assert_eq!(a, cache_key_with("source", "main", "cs_6_6", &[]));
+        assert_ne!(a, cache_key_with("source", "main", "cs_6_6", &["-O1"]));
+        assert_ne!(cache_key_with("source", "main", "cs_6_6", &["-O1"]), cache_key_with("source", "main", "cs_6_6", &["-O0"]));
+        assert_ne!(cache_key_with("source", "main", "cs_6_6", &["-O1", "-O2"]), cache_key_with("source", "main", "cs_6_6", &["-O1 -O2"]));
+    }
+
+    #[test]
+    fn compiles_with_other_dxc_arguments_are_cache_misses() {
+        let dir = std::env::temp_dir().join(format!("xcl-dxil-args-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let counters = CacheCounters::default();
+        let (a, hit) = compile_cached_in_observed(&dir, "args source", "main", "cs_6_6", &["-O0"], &counters, || Ok(synthetic_dxil(1))).unwrap();
+        assert!(!hit);
+        let (b, hit) = compile_cached_in_observed(&dir, "args source", "main", "cs_6_6", &["-O1"], &counters, || Ok(synthetic_dxil(2))).unwrap();
+        assert!(!hit, "-O1 must not get the -O0 DXIL");
+        assert_ne!(a, b);
+        let (c, hit) = compile_cached_in_observed(&dir, "args source", "main", "cs_6_6", &["-O0"], &counters, || panic!("-O0 was cached")).unwrap();
+        assert!(hit);
+        assert_eq!(a, c);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn cache_key_tracks_the_dxc_toolchain() {
-        let a = cache_key_for_toolchain("source", "main", "cs_6_6", "compiler-a/signer-a");
-        assert_eq!(a, cache_key_for_toolchain("source", "main", "cs_6_6", "compiler-a/signer-a"));
-        assert_ne!(a, cache_key_for_toolchain("source", "main", "cs_6_6", "compiler-b/signer-a"));
-        assert_ne!(a, cache_key_for_toolchain("source", "main", "cs_6_6", "compiler-a/signer-b"));
+        let a = cache_key_for_toolchain("source", "main", "cs_6_6", &[], "compiler-a/signer-a");
+        assert_eq!(a, cache_key_for_toolchain("source", "main", "cs_6_6", &[], "compiler-a/signer-a"));
+        assert_ne!(a, cache_key_for_toolchain("source", "main", "cs_6_6", &[], "compiler-b/signer-a"));
+        assert_ne!(a, cache_key_for_toolchain("source", "main", "cs_6_6", &[], "compiler-a/signer-b"));
     }
 
     #[test]
@@ -1095,7 +1142,7 @@ mod cache_tests {
             let mut threads = Vec::new();
             for _ in 0..8 {
                 threads.push(s.spawn(|| {
-                    let (dxil, hit) = compile_cached_in_observed(&dir, "same source", "main", "cs_6_6", &counters, || {
+                    let (dxil, hit) = compile_cached_in_observed(&dir, "same source", "main", "cs_6_6", &[], &counters, || {
                         calls.fetch_add(1, Ordering::SeqCst);
                         std::thread::sleep(Duration::from_millis(25));
                         Ok(synthetic_dxil(4))
