@@ -20,6 +20,8 @@ DXIL cache filled beforehand with `xcl shaders --precompile` (22 800 / 26 503 pr
 | 8 | `exp/series-s` (+ #242), `device_type = "lockhart"` | 40 s | as 6 | account prompt | 30 | title assert `0x80000003` at `+0xb18de7` ~3 s after the account is picked |
 | 9 | as 8, fresh `XCL_DATA_ROOT` | 39 s | as 5 | account prompt | 30 | same assert, same address: not the saved settings |
 | 10 | `d44e8e8` (main with #574, #636, in-place detiling + #533 / #267) | 132 s | as 6 | world loading from ~95 s (earlier than before) | 30 → 0 | **stack overflow** `0xc00000fd` at `+0x43c042` at 118 s, not the watchdog; just before: `Wait64BitValueX timed out … want 0x800 … memory holds Some(0)` (the never-written counter of #505); VRAM 14.1 GB, target pages 9.9 GB |
+| 11 | `d44e8e8` | 124 s (then hung on exit) | as 6 | world loading | 30 → 0 | watchdog `+0x23cf683` again (run 10's stack overflow did not repeat) |
+| 12 | `6d67c35` (+ #634: driver compute blobs on disk) | 138 s | as 6 | story loading screen (artwork) at ~90 s | 30 → 0 | **no watchdog**: `Wait64BitValueX … want 0x802 … memory holds Some(0)`, then read of `0xffffffffffffffff` at `+0x81cb67` – the title reading data the GPU never wrote (the out-of-order wait the XCL devs describe) |
 
 Series S profile (runs 8–9): at the menus video memory is 7.3 GB with 1.9 GB of target pages
 (Series X: ~6 GB / ~5 GB later), but the title asserts at `+0xb18de7` right after the account
