@@ -30,6 +30,10 @@ DXIL cache filled beforehand with `xcl shaders --precompile` (22 800 / 26 503 pr
 | 17 | `fa6e820` (pc-stack e915150 + #708 + #640), budget 6 GB, 99 driver blobs precompiled offline (`feat/precompile-driver-blobs`) | 148 s | as 6 | world loading from ~75 s | 30 → 0 | **32 compute pipelines from kept driver blobs**, 12 still building past 4 s (run 16: 13); VRAM 10.3 GB; watchdog at ~145 s (runs 15–16: ~128 s) |
 | 18 | `d9a215b` (pc-stack e333be8 = main with #795 / #797 / #792 / #798, + #533 / #267, + #640), budget 6 GB | 153 s | as 6 | world loading from ~80 s | 30 → 0 | 0 `Wait64` timeouts (upstream's fence bridge); **0 driver blobs used** – the recompiler changes in #792 / #798 give new DXIL, so the 152 kept blobs no longer match; 13 compute pipelines still building; watchdog at 149 s (latest yet) |
 | 19 | `exp/budget` (pc-stack a373222 = main with #795 / #797 / #866 / #897, + #533 / #267, + #640), budget 6 GB, **`XCL_COMPUTE_PSO_WAIT_MS=50 XCL_PSO_WAIT_MS=50`** (as #891) | 380 s | as 6 | world loading from ~75 s; bursts of draws (424 in 2 s at 216 s) | 30 → mostly 0 | **no watchdog** – 41 binds bounded at 50 ms, 64 compute pipelines from kept blobs, 0 `Wait64` timeouts, 11 presents from 150 to 380 s; at ~370 s three GPU `queue.Wait`s (fence bridge) not done within 5 s, released on the CPU; 380 s **device removed `0x887a0006`**, then the title's assert `0x80000003` at `+0x2474606`; VRAM 11.7 GB, commit 28.5 GB; process hung on exit |
+| 20 | `exp/budget`, as 19 + `XCL_DRED=1` | – | as 6 | – | – | **froze 16 s in** (log stops, one core busy): full DRED stalls this title on the NVIDIA driver, as XDefiant before |
+| 21 | `exp/all` (pc-stack 7946ef2 + #640 + #782 + #889 + DRED modes), `XCL_DRED=breadcrumbs` | – | as 6 | – | – | **froze 8 s in**: breadcrumbs alone are enough to stall it |
+| 22 | `exp/all`, no DRED, budget 6 GB, waits 50 ms / 50 ms | 332 s | as 6 | world loading | 30 → 0 | 128 compute pipelines from kept blobs, >1 000 built ahead (#889); 16 compute + 25 graphics binds bounded; **#782 keeps the budget from holding**: target pages 9.5 GB, local VRAM 14.2 → 15.1 GB; `queue.Wait … >= 0x7e1 … completed=0x7e0` (producer q2) at 324 s; **device removed `0x887a0006` at 332 s**, assert `+0x2474606` – the same end as run 19 |
+| 23 | `exp/all`, budget 6 GB, **compute waits unbounded** (`XCL_COMPUTE_PSO_WAIT_MS=0`), graphics 50 ms | 119 s | as 6 | world loading | 30 → 0 | 222 compute pipelines from kept blobs, 303 built fresh, only 4 of them ≥ 1 s (12 / 9 / 4 / 2.7 s); DXIL cache 2 305 hits / 3 misses; **watchdog at 119 s** – the crash-time thread dump has a **title thread inside `nvgpucomp64.dll`** building the next one itself |
 
 #708 removes the never-written-counter waits on this machine (runs 13–16; run 12 had them), and #640's
 budget keeps video memory under the 12 GB card (runs 15–16). What is left on an RTX 4070 Ti is the
@@ -104,3 +108,15 @@ build's driver blob where a title's compute pipeline looks for it (#634's `drive
 title wrote in earlier runs are found under the same names ("kept already"), so the DXIL matches.
 After 99 blobs (75 builds, ~25 per 6–10 min on the 4070 Ti), run 17 made 32 pipelines from them;
 the world's stalling programs were not among them yet, so the precompile is left to finish.
+
+## The GPU hang (runs 19, 22) and what removes it
+
+Both hangs: one title queue's last submitted value is never completed (`submitted=N, completed=N-1`),
+every waiter on it times out in #795's fence bridge 5 s later, and ~10–30 s after that the device is
+removed (`0x887a0006`, a command that never ends). Both runs had compute dispatches skipped with
+stand-ins (bounded waits); a skipped dispatch leaves its outputs unwritten, which a later indirect
+command or loop count can read. Unbounded compute waits (run 23) skip nothing but put the driver's
+compile on the title's thread → watchdog. With every big compute program's driver blob kept
+(offline precompile, `feat/precompile-driver-blobs` / #744), compute waits can stay unbounded without
+long compiles – the precompile is being run to completion to test that. DRED (runs 20, 21) cannot
+be used on this title on NVIDIA: it freezes it at start.
