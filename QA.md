@@ -22,6 +22,11 @@ DXIL cache filled beforehand with `xcl shaders --precompile` (22 800 / 26 503 pr
 | 10 | `d44e8e8` (main with #574, #636, in-place detiling + #533 / #267) | 132 s | as 6 | world loading from ~95 s (earlier than before) | 30 → 0 | **stack overflow** `0xc00000fd` at `+0x43c042` at 118 s, not the watchdog; just before: `Wait64BitValueX timed out … want 0x800 … memory holds Some(0)` (the never-written counter of #505); VRAM 14.1 GB, target pages 9.9 GB |
 | 11 | `d44e8e8` | 124 s (then hung on exit) | as 6 | world loading | 30 → 0 | watchdog `+0x23cf683` again (run 10's stack overflow did not repeat) |
 | 12 | `6d67c35` (+ #634: driver compute blobs on disk) | 138 s | as 6 | story loading screen (artwork) at ~90 s | 30 → 0 | **no watchdog**: `Wait64BitValueX … want 0x802 … memory holds Some(0)`, then read of `0xffffffffffffffff` at `+0x81cb67` – the title reading data the GPU never wrote (the out-of-order wait the XCL devs describe) |
+| 13 | `exp/wait-order` (`08c4eb7` + #708) | 102 s | as 6 | world loading from ~85 s | 30 → 0 | **0 `Wait64BitValueX` timeouts**; null writes at 90.6 s (`vcruntime140+0x14d3` write 0x20, then two more) ~2.5 s after the first `#101`; VRAM 14.6 GB |
+| 14 | same | 120 s | as 6 | world loading from ~85 s | 30 → 0 | **0 `Wait64` timeouts** again; watchdog `+0x23cf683` at 116 s; VRAM 14.2 GB, target pages 9.7 GB. Run 13's null writes did not repeat |
+
+#708 removes the never-written-counter waits on this machine in both runs (run 12 had them). What is
+left here is the world-loading stall with local video memory ~2 GB past the 12 GB card (#560 / #320).
 
 Series S profile (runs 8–9): at the menus video memory is 7.3 GB with 1.9 GB of target pages
 (Series X: ~6 GB / ~5 GB later), but the title asserts at `+0xb18de7` right after the account
