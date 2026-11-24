@@ -1,17 +1,18 @@
 # pc-stack
 
-Upstream `ivall/xcl` main plus PRs picked for a Windows PC with an **NVIDIA RTX 40-series GPU
+Upstream `ivall/xcl` main plus open PRs picked for a Windows PC with an **NVIDIA RTX 40-series GPU
 (32-lane waves) and an Intel CPU**. Rebuilt on newer upstream main as PRs land; each entry
 says why it is here and drops out once upstream merges it.
 
 | PR | What | Why on this machine |
 |---|---|---|
-| [#300](https://github.com/ivall/xcl/pull/300) | finest system timer for the title | choppy audio on Windows (#260) |
 | [#533](https://github.com/ivall/xcl/pull/533) | compute pipeline waits are bounded and built on workers | slow NVIDIA driver compiles tripped the title's watchdog (#232) |
 | [#267](https://github.com/ivall/xcl/pull/267) | a draw waits at most 4 s for a graphics pipeline | same watchdog, graphics side |
 
 Merge notes: #533 and #267 both edit `pso_async.rs`; `resolve_for_indirect` keeps #533's
 bounded compute path and uses #267's `resolve_for_draw` for graphics. Both test modules kept.
+
+Dropped once merged upstream: #300 (title timer, choppy audio).
 
 ## Checked
 
