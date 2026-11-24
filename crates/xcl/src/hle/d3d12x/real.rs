@@ -816,6 +816,11 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
             v[1 + newer] = super::guard::make_layout_split(super::guard::LayoutTargets { older: v[1 + newer], newer: f, pc, newer_layout: &QUEUE_SHIFTED });
         }
     }
+    // diagnostic: the newer layout's command list #101 (not on PC; a retail title calls it during
+    // world loading, shortly before its GPU watchdog) – its arguments logged, answered like the stub
+    if kind == Kind::CommandList && LIST_101 < total {
+        v[1 + LIST_101] = list_101_probe as usize;
+    }
     // XCL_D3D12_TRACE: every public method called from console code is logged
     if std::env::var_os("XCL_D3D12_TRACE").is_some() {
         for i in 0..public {
@@ -5438,4 +5443,33 @@ mod console_format_query_tests {
             assert!(pc.SizeInBytes != u64::MAX && pc.SizeInBytes >= 1920 * 1080 * 4 && pc.Alignment > 0, "PC {format} as {}: {:#x}", d.Format.0, pc.SizeInBytes);
         }
     }
+}
+
+
+/// The newer command list layout's slot #101 (no known PC counterpart).
+const LIST_101: usize = 101;
+
+/// Logs the first calls of command list #101 with their raw arguments and returns 0, as the
+/// stub did: what the method takes (an address the title later waits on? a value?) is open.
+unsafe extern "system" fn list_101_probe(this: *mut c_void, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
+    static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = CALLS.fetch_add(1, Ordering::Relaxed);
+    if n < 24 || n.is_power_of_two() {
+        let peek = |a: u64| -> String {
+            // a title address in memory the CPU can read: its current 64-bit contents
+            if (0x1_0000..0x8000_0000_0000).contains(&a) && a % 8 == 0 && crate::gpu::shader::readable(a as usize, 8) {
+                format!(" [{:#x}]", std::ptr::read_volatile(a as *const u64))
+            } else {
+                String::new()
+            }
+        };
+        crate::xlog_warn!(
+            "D3D12.X: command list #101 call {} on {this:p}: {a1:#x}{} {a2:#x}{} {a3:#x}{} {a4:#x} {a5:#x}",
+            n + 1,
+            peek(a1),
+            peek(a2),
+            peek(a3)
+        );
+    }
+    0
 }
