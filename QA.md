@@ -17,6 +17,13 @@ DXIL cache filled beforehand with `xcl shaders --precompile` (22 800 / 26 503 pr
 | 5 | `e8c33a2` | 368 s | as 4 until 147 s; terms ticked and confirmed at 175 s; A every 5 s | **world loading** (spinner, DirectStorage streaming 60–350 MB / 2 s) | 30 → ~1 → 0 | **title watchdog** `+0x23cf683` (null write via `+0x2215c35`) at 363 s |
 | 6 | `e8c33a2`, waits 1 ms | 347 s | as 5 (terms already saved) | world loading from ~150 s | 30 → mostly 0 | watchdog at 343 s, VRAM 14.4 GB |
 | 7 | `diag/list-101` | 215 s | as 6 | world loading | 30 → 0 | watchdog at 215 s, VRAM 13.7 GB |
+| 8 | `exp/series-s` (+ #242), `device_type = "lockhart"` | 40 s | as 6 | account prompt | 30 | title assert `0x80000003` at `+0xb18de7` ~3 s after the account is picked |
+| 9 | as 8, fresh `XCL_DATA_ROOT` | 39 s | as 5 | account prompt | 30 | same assert, same address: not the saved settings |
+
+Series S profile (runs 8–9): at the menus video memory is 7.3 GB with 1.9 GB of target pages
+(Series X: ~6 GB / ~5 GB later), but the title asserts at `+0xb18de7` right after the account
+prompt, every time, on current main + #242. #242's own Series S run was on an older base with
+#203; not followed further here.
 
 ## Run 5: world loading and the watchdog
 
