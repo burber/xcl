@@ -28,6 +28,7 @@ DXIL cache filled beforehand with `xcl shaders --precompile` (22 800 / 26 503 pr
 | 15 | `exp/page-budget` (#708 + #640), `XCL_PAGE_BUDGET_MB=6144` | 130 s | as 6 | world loading from ~80 s | 30 → 0 | **video memory 10.3 GB (under the card)**, target pages 5.5 GB, 7 316 textures evicted, 42 mapped again; 0 `Wait64` timeouts; watchdog at 127 s with 10 compute pipelines "still building after 4000 ms" from 101 s |
 | 16 | same | 132 s | as 6 | world loading from ~75 s | 30 → 0 | 546 shader sets built ahead (run 15: 525); 13 compute pipelines still building at ~103 s; VRAM 10.4 GB; watchdog at 129 s |
 | 17 | `fa6e820` (pc-stack e915150 + #708 + #640), budget 6 GB, 99 driver blobs precompiled offline (`feat/precompile-driver-blobs`) | 148 s | as 6 | world loading from ~75 s | 30 → 0 | **32 compute pipelines from kept driver blobs**, 12 still building past 4 s (run 16: 13); VRAM 10.3 GB; watchdog at ~145 s (runs 15–16: ~128 s) |
+| 18 | `d9a215b` (pc-stack e333be8 = main with #795 / #797 / #792 / #798, + #533 / #267, + #640), budget 6 GB | 153 s | as 6 | world loading from ~80 s | 30 → 0 | 0 `Wait64` timeouts (upstream's fence bridge); **0 driver blobs used** – the recompiler changes in #792 / #798 give new DXIL, so the 152 kept blobs no longer match; 13 compute pipelines still building; watchdog at 149 s (latest yet) |
 
 #708 removes the never-written-counter waits on this machine (runs 13–16; run 12 had them), and #640's
 budget keeps video memory under the 12 GB card (runs 15–16). What is left on an RTX 4070 Ti is the
