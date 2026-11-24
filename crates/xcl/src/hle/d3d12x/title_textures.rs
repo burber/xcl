@@ -560,6 +560,58 @@ pub fn list_reset(list: usize) {
     }
 }
 
+/// Page budget: evicted textures `revive` are mapped again and uploaded whole at the next look.
+/// One that could not be mapped stays evicted, for the next use to try again.
+fn map_again(revive: &[usize]) {
+    let mut mapped = Vec::with_capacity(revive.len());
+    for &res in revive {
+        // released since it was taken from the evicted (its pages forgotten): not touched
+        if !super::vram::is_placed_texture(res) {
+            continue;
+        }
+        let p = res as *mut c_void;
+        if !unsafe { ID3D12Resource::from_raw_borrowed(&p).is_some_and(|r| super::vram::remap_if_unmapped(r)) } {
+            super::vram::evicted_again(res);
+            continue;
+        }
+        forget_content(res);
+        mapped.push(res);
+    }
+    if mapped.is_empty() {
+        return;
+    }
+    let mut t = TEXTURES.lock().unwrap();
+    for res in mapped {
+        if let Some(e) = t.get_mut(res) {
+            if !e.pending {
+                e.pending = true;
+                PENDING.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Page budget: about once a second, the textures whose T# is in a shader-visible view heap
+/// are in use (a title that only samples a texture submits no transition for it); evicted ones
+/// among them are mapped again before the title's next work.
+fn look_at_view_heaps() {
+    if !super::vram::tracking() || super::console_heap::global_heap().is_none() {
+        return;
+    }
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    {
+        let mut last = LAST.lock().unwrap();
+        let now = std::time::Instant::now();
+        if last.is_some_and(|l| now.duration_since(l) < std::time::Duration::from_secs(1)) {
+            return;
+        }
+        *last = Some(now);
+    }
+    let (visible, cpu_only) = super::console_heap::referenced();
+    let back = super::vram::seen(&visible, &cpu_only);
+    map_again(&back);
+}
+
 /// The PC lists `lists` were submitted, in this order: the textures kept in step are in the
 /// states their transitions leave them in.
 pub fn submitted(lists: &[*mut c_void]) {
@@ -582,22 +634,8 @@ pub fn submitted(lists: &[*mut c_void]) {
             revive.push(res);
         }
     }
-    for &res in &revive {
-        let p = res as *mut c_void;
-        if let Some(r) = unsafe { ID3D12Resource::from_raw_borrowed(&p) } {
-            unsafe { super::vram::remap_if_unmapped(r) };
-        }
-        forget_content(res);
-    }
+    map_again(&revive);
     let mut t = TEXTURES.lock().unwrap();
-    for res in revive {
-        if let Some(e) = t.get_mut(res) {
-            if !e.pending {
-                e.pending = true;
-                PENDING.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
     for (res, sub, after) in notes {
         if let Some(e) = t.get_mut(res) {
             let n = subresource_count(&e.tex);
@@ -765,6 +803,9 @@ unsafe fn refresh_once(queue: *mut c_void) {
             crate::xlog_info!("frame trace: title textures: {with} with data in memory, {without} all zero; {dirty_len} dirty pages this look");
         }
     }
+    // page budget: textures in use by their T#; evicted ones are mapped again (before the
+    // queue waits for the mappings) and uploaded below
+    look_at_view_heaps();
     // the title's own memory: what the CPU wrote goes to its video memory first
     if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
         DIRTY_BUF.with(|dcell| {

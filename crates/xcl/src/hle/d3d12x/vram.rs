@@ -193,6 +193,15 @@ fn pool_cap() -> usize {
 static EVICTED: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 static EVICTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static REMAPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Page budget: textures with no T# in any view heap (while the heaps are looked at) may be
+/// evicted this long after they were placed or last seen, small ones too.
+const EVICT_UNSEEN_AGE: std::time::Duration = std::time::Duration::from_secs(2);
+/// whether the console view heaps are looked at (`seen`): only then does "no T#" mean unused
+static HEAPS_LOOKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Page budget: after a round that gave back fewer tiles than wanted (the rest of the
+/// candidates' pages are shared), the next is not tried for this long: every tile taken at the
+/// budget would otherwise sort and walk the same textures again.
+const EVICT_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// A pool tile: (pool heap, tile in it).
 type Tile = (u32, u32);
@@ -247,8 +256,18 @@ struct Target {
     used_extra: Vec<(usize, usize)>,
     /// a texture the CPU fills (its texels can be uploaded again from the title's memory)
     evictable: bool,
-    /// placed, remapped or transitioned last
+    /// placed, remapped, transitioned or its T# seen in a shader-visible heap last
     touched: std::time::Instant,
+    /// where the last look at the view heaps found its T# (`seen`)
+    seen: Seen,
+}
+
+/// Where a texture's T# was at the last look at the console view heaps.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Seen {
+    None,
+    CpuOnly,
+    Visible,
 }
 
 /// The title's pages of video memory for tiled textures (see the module's comment).
@@ -272,6 +291,8 @@ struct Pages {
     targets: std::collections::HashMap<usize, Target>,
     /// queue → the fence value it last waited for
     waited: std::collections::HashMap<usize, u64>,
+    /// no eviction round before this (`EVICT_RETRY`)
+    evict_after: Option<std::time::Instant>,
 }
 
 // D3D12 objects are free-threaded
@@ -304,6 +325,7 @@ impl Pages {
             idle: std::collections::VecDeque::new(),
             targets: std::collections::HashMap::new(),
             waited: std::collections::HashMap::new(),
+            evict_after: None,
         })
     }
 
@@ -435,20 +457,43 @@ impl Pages {
 
     /// Page budget: unmap CPU-filled textures, least recently touched first, until `want`
     /// tiles came back (pages other mapped textures still share stay). Each goes to `EVICTED`.
+    /// After a round that fell short, none for `EVICT_RETRY`.
     unsafe fn evict_lru(&mut self, want: usize) {
         let now = std::time::Instant::now();
+        if self.evict_after.is_some_and(|t| now < t) {
+            return;
+        }
         let before = self.free.len() + self.cooling.len();
-        let mut order: Vec<(std::time::Instant, usize)> = self
+        // with the view heaps looked at, a texture whose T# is in none cannot be sampled: it
+        // goes first, small or not, once `EVICT_UNSEEN_AGE` old
+        let heaps = HEAPS_LOOKED.load(std::sync::atomic::Ordering::Relaxed);
+        let mut order: Vec<(bool, std::time::Instant, usize)> = self
             .targets
             .iter()
-            .filter(|(_, t)| t.evictable && t.mapped && t.total >= EVICT_MIN_TILES && now.duration_since(t.touched) >= EVICT_MIN_AGE)
-            .map(|(&k, t)| (t.touched, k))
+            .filter_map(|(&k, t)| {
+                if !t.evictable || !t.mapped {
+                    return None;
+                }
+                let unseen = heaps && t.seen == Seen::None;
+                let age = now.duration_since(t.touched);
+                let ok = if unseen { age >= EVICT_UNSEEN_AGE } else { t.total >= EVICT_MIN_TILES && age >= EVICT_MIN_AGE };
+                ok.then_some((!unseen, t.touched, k))
+            })
             .collect();
         order.sort_unstable();
         let mut evicted = Vec::new();
-        for (_, key) in order {
+        let mut shared = 0u64;
+        for (_, _, key) in order {
             if self.free.len() + self.cooling.len() - before >= want {
                 break;
+            }
+            let Some(t) = self.targets.get(&key) else { continue };
+            // a texture whose pages all are other mapped textures' too gives nothing back
+            let alone = t.used.iter().any(|a| self.pages.get(a).is_some_and(|p| p.users <= 1))
+                || t.used_extra.iter().any(|k| self.extra_pages.get(k).is_some_and(|p| p.users <= 1));
+            if !alone {
+                shared += 1;
+                continue;
             }
             let Some(t) = self.targets.get_mut(&key) else { continue };
             let total = t.total;
@@ -462,14 +507,15 @@ impl Pages {
             self.release_tiles(used, used_extra, now, true);
             evicted.push(key);
         }
+        let freed = self.free.len() + self.cooling.len() - before;
+        self.evict_after = (freed < want).then(|| now + EVICT_RETRY);
         if !evicted.is_empty() {
             let n = EVICTIONS.fetch_add(evicted.len() as u64, std::sync::atomic::Ordering::Relaxed) + evicted.len() as u64;
-            let freed = self.free.len() + self.cooling.len() - before;
             static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let step = LOGGED.load(std::sync::atomic::Ordering::Relaxed);
             if n >= step {
                 LOGGED.store(n.max(1) * 2, std::sync::atomic::Ordering::Relaxed);
-                crate::xlog_info!("D3D12.X: page budget: {} textures evicted ({} MB back) this round, {n} so far", evicted.len(), (freed * PAGE) >> 20);
+                crate::xlog_info!("D3D12.X: page budget: {} textures evicted ({} MB back) this round, {n} so far; {shared} passed over, all their pages shared", evicted.len(), (freed * PAGE) >> 20);
             }
             EVICTED.lock().unwrap().get_or_insert_with(HashSet::new).extend(evicted);
         }
@@ -607,7 +653,7 @@ unsafe fn place_on_pages(
         *ppv = std::ptr::null_mut();
         return None;
     };
-    pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra, evictable: !require_aligned, touched: std::time::Instant::now() });
+    pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra, evictable: !require_aligned, touched: std::time::Instant::now(), seen: Seen::None });
     drop(g);
     PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(raw as usize);
     Some(hr)
@@ -662,6 +708,14 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
     true
 }
 
+/// Page budget: `res`, taken from the evicted, could not be mapped again: evicted still.
+pub(super) fn evicted_again(res: usize) {
+    if is_placed_texture(res) {
+        EVICTED.lock().unwrap().get_or_insert_with(HashSet::new).insert(res);
+        REMAPS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Page budget: `res` was evicted by the page budget; true once, and the caller maps it
 /// again (`remap_if_unmapped`) and uploads it whole.
 pub(super) fn take_evicted(res: usize) -> bool {
@@ -678,9 +732,45 @@ pub(super) fn any_evicted() -> bool {
     EVICTED.lock().unwrap().as_ref().is_some_and(|s| !s.is_empty())
 }
 
+/// Whether the page budget follows the use of textures.
+pub(super) fn tracking() -> bool {
+    pool_cap() != 0
+}
+
+/// Page budget: the T# of the textures `visible` is in a shader-visible view heap (they may be
+/// sampled: recent now), that of `cpu_only` only in CPU-only heaps. Returns the evicted ones of
+/// `visible`, which the caller maps again and uploads before the title's next work.
+pub(super) fn seen(visible: &[usize], cpu_only: &[usize]) -> Vec<usize> {
+    let now = std::time::Instant::now();
+    HEAPS_LOOKED.store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut g = PAGES.lock().unwrap();
+    for pages in g.values_mut().flatten() {
+        for t in pages.targets.values_mut() {
+            t.seen = Seen::None;
+        }
+        for r in visible {
+            if let Some(t) = pages.targets.get_mut(r) {
+                t.touched = now;
+                t.seen = Seen::Visible;
+            }
+        }
+        for r in cpu_only {
+            if let Some(t) = pages.targets.get_mut(r) {
+                t.seen = Seen::CpuOnly;
+            }
+        }
+    }
+    drop(g);
+    let mut e = EVICTED.lock().unwrap();
+    let Some(e) = e.as_mut().filter(|s| !s.is_empty()) else { return Vec::new() };
+    let back: Vec<usize> = visible.iter().copied().filter(|r| e.remove(r)).collect();
+    REMAPS.fetch_add(back.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    back
+}
+
 /// Page budget: `res` was used (a transition the title submitted): later to be evicted.
 pub(super) fn touch(res: usize) {
-    if pool_cap() == 0 {
+    if !tracking() {
         return;
     }
     let mut g = PAGES.lock().unwrap();
@@ -1097,6 +1187,67 @@ mod tests {
 
     /// Page budget: the least recently touched CPU-filled texture gives its
     /// pages back first, a GPU-written one never does, and an evicted one maps again.
+    #[test]
+    fn page_budget_takes_unseen_textures_first_and_passes_over_shared_pages() {
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap();
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::Win32::Graphics::Dxgi::*;
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().expect("DXGI factory");
+            let Ok(adapter) = factory.EnumAdapters1(0) else { return };
+            if adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
+                return;
+            }
+            let mut dev: Option<ID3D12Device> = None;
+            let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            let Some(dev) = dev.filter(|d| tier2(d)) else { return };
+            super::super::real::adopt(dev.as_raw(), super::super::real::Kind::Device);
+            let desc = D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 512, Height: 512, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8G8B8A8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() };
+            let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
+            let place_at = |va: usize| {
+                let mut p = std::ptr::null_mut();
+                let hr = place_pages(dev.as_raw(), va, &desc, D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), Some(1 << 20), riid, &mut p);
+                if !hr.is_some_and(|hr| hr >= 0) || p.is_null() {
+                    return None;
+                }
+                Some(ID3D12Resource::from_raw(p))
+            };
+            // two textures at the same address share every page
+            let (Some(a), Some(b), Some(unseen), Some(own)) = (place_at(0x61_0000_0000), place_at(0x61_0000_0000), place_at(0x61_1000_0000), place_at(0x61_2000_0000)) else {
+                crate::gpu::recomp::runner::skip_test("no reserved textures");
+                return;
+            };
+            let key = |r: &ID3D12Resource| r.as_raw() as usize;
+            let dev_key = dev.as_raw() as usize;
+            let now = Instant::now();
+            HEAPS_LOOKED.store(true, std::sync::atomic::Ordering::Relaxed);
+            {
+                let mut g = PAGES.lock().unwrap();
+                let pages = g.get_mut(&dev_key).unwrap().as_mut().unwrap();
+                for (r, age, seen) in [(&a, 60, Seen::CpuOnly), (&b, 60, Seen::CpuOnly), (&unseen, 3, Seen::None), (&own, 30, Seen::CpuOnly)] {
+                    let t = pages.targets.get_mut(&key(r)).unwrap();
+                    t.touched = now - Duration::from_secs(age);
+                    t.seen = seen;
+                }
+                pages.evict_lru(1);
+                assert!(!pages.targets[&key(&unseen)].mapped, "a texture with no T# goes first, though younger");
+                assert!(pages.targets[&key(&a)].mapped && pages.targets[&key(&b)].mapped && pages.targets[&key(&own)].mapped);
+                pages.evict_lru(1);
+                assert!(pages.targets[&key(&a)].mapped && pages.targets[&key(&b)].mapped, "shared pages give nothing back: passed over");
+                assert!(!pages.targets[&key(&own)].mapped, "the next with pages of its own is evicted");
+                assert!(pages.evict_after.is_none(), "rounds that gave back what was wanted are not held back");
+                pages.evict_lru(usize::MAX);
+                assert!(pages.evict_after.is_some_and(|t| t > Instant::now()), "a round that fell short holds the next back");
+                assert!(pages.targets[&key(&a)].mapped && pages.targets[&key(&b)].mapped);
+            }
+            HEAPS_LOOKED.store(false, std::sync::atomic::Ordering::Relaxed);
+            assert!(take_evicted(key(&unseen)) && take_evicted(key(&own)));
+            drop((a, b, unseen, own));
+        }
+    }
+
     #[test]
     fn page_budget_evicts_the_least_recently_touched_cpu_filled_texture() {
         let _vram_guard = VRAM_TEST_LOCK.lock().unwrap();
