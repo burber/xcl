@@ -140,6 +140,37 @@ pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
     }
 }
 
+/// The title's allocator `alloc` is gone (its last Release): nothing of it stays here – a later
+/// allocator may get its address, and must not go on with this one's PC allocators. The ones
+/// made here go with it (those lists still record on are left alone: not freed, not tracked).
+pub unsafe fn forget(alloc: usize) {
+    let made: Vec<usize> = {
+        let mut g = STATE.lock().unwrap();
+        let Some(s) = g.as_mut() else { return };
+        s.types.remove(&alloc);
+        let mut mine: Vec<usize> = s.aside.remove(&alloc).unwrap_or_default();
+        mine.extend(s.cur.remove(&alloc));
+        mine.push(alloc);
+        let mut made = Vec::new();
+        for b in mine {
+            let free = s.backings.get(&b).is_none_or(|x| x.free());
+            if let Some(gone) = s.backings.remove(&b) {
+                for l in gone.users {
+                    s.of_list.remove(&l);
+                }
+            }
+            if b != alloc && free {
+                made.push(b);
+            }
+        }
+        made
+    };
+    // (outside the lock: their Release comes back here)
+    for b in made {
+        drop(ID3D12CommandAllocator::from_raw(b as *mut c_void));
+    }
+}
+
 /// The title resets its allocator `alloc`. `None`: reset it as it is (nothing holds a
 /// recording on it, or this is off). `Some(hr)`: done here – the PC allocator in use was put
 /// aside with its recordings and another one took its place.
@@ -265,6 +296,19 @@ mod tests {
             alloc.Reset().unwrap();
             assert_eq!(current(a as usize), a as usize, "the allocator put aside is free again");
             assert!(dev.GetDeviceRemovedReason().is_ok());
+
+            // the title's allocator goes while another PC allocator stands for it: nothing of
+            // it stays (the next allocator at its address is its own)
+            list.Reset(&alloc, None).unwrap();
+            for_list(l as usize, a as usize, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+            list.Close().unwrap();
+            alloc.Reset().unwrap();
+            assert_ne!(current(a as usize), a as usize);
+            drop(lists);
+            drop(list);
+            drop(alloc);
+            assert_eq!(current(a as usize), a as usize, "a released allocator leaves nothing behind");
+            assert!(!STATE.lock().unwrap().as_ref().unwrap().types.contains_key(&(a as usize)));
         }
     }
 }
