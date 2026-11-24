@@ -714,7 +714,7 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
     };
     if args.iter().any(|a| a == "--precompile") {
         let only = args.iter().position(|a| a == "--only").and_then(|i| args.get(i + 1)).map(|s| s.to_ascii_lowercase());
-        let pipelines = args.iter().any(|a| a == "--pipelines");
+        let pipelines = args.iter().any(|a| a == "--pipelines").then(|| opt("--pipeline-min-kb").unwrap_or(0) << 10);
         return precompile(&input, opt("--limit").unwrap_or(usize::MAX), opt("--windows").unwrap_or(4) as u32, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, t0);
     }
     let agg = analyze(&input, recomp_on, compile, iface_on);
@@ -737,11 +737,21 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
 /// ABI root signature with its static samplers): the driver keeps what it compiled in its own
 /// cache, which the title then finds – a retail game's 1 MB-DXIL programs kept its loading
 /// waiting for the driver's compiler for minutes. Nothing runs on the GPU.
+/// The driver's blob of each build is also kept where a title's compute pipeline looks for it
+/// (`real::driver_cache`, the DXIL cache's `driver\`): a driver that keeps no cache of its own
+/// for big programs (NVIDIA: 5 - 30 s each, the title's watchdog ends it before they are
+/// built) gets them from there at their first bind. A program whose blob is kept already is
+/// skipped (resumable); `--pipeline-min-kb N`: only programs of at least N KB of DXIL.
 struct Pipelines {
     dev: windows::Win32::Graphics::Direct3D12::ID3D12Device,
     signatures: Mutex<std::collections::HashMap<Vec<u32>, windows::Win32::Graphics::Direct3D12::ID3D12RootSignature>>,
     made: AtomicUsize,
     refused: AtomicUsize,
+    /// driver blobs written for titles / found kept already (skipped)
+    kept: AtomicUsize,
+    had: AtomicUsize,
+    /// programs with less DXIL than this are not built (`--pipeline-min-kb`)
+    min_dxil: usize,
     /// driver compiles running and the most at once (`XCL_PIPELINE_THREADS`, 4): each of the
     /// biggest takes ~1.5 GB in the driver – fifteen at once took 24 GB
     running: (Mutex<usize>, std::sync::Condvar),
@@ -752,7 +762,7 @@ struct Pipelines {
 unsafe impl Sync for Pipelines {}
 
 impl Pipelines {
-    fn new() -> Result<Pipelines, String> {
+    fn new(min_dxil: usize) -> Result<Pipelines, String> {
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
         use windows::Win32::Graphics::Dxgi::*;
         unsafe {
@@ -761,13 +771,32 @@ impl Pipelines {
             let (adapter, _) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
             let dev = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?;
             let most = std::env::var("XCL_PIPELINE_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize).max(1);
-            Ok(Pipelines { dev, signatures: Mutex::new(Default::default()), made: AtomicUsize::new(0), refused: AtomicUsize::new(0), running: (Mutex::new(0), std::sync::Condvar::new()), most })
+            Ok(Pipelines {
+                dev,
+                signatures: Mutex::new(Default::default()),
+                made: AtomicUsize::new(0),
+                refused: AtomicUsize::new(0),
+                kept: AtomicUsize::new(0),
+                had: AtomicUsize::new(0),
+                min_dxil,
+                running: (Mutex::new(0), std::sync::Condvar::new()),
+                most,
+            })
         }
     }
 
     /// The compute pipeline of `c` (made and released).
     fn make(&self, c: &recomp::pso::Compiled) {
         use windows::Win32::Graphics::Direct3D12::*;
+        if c.dxil.len() < self.min_dxil {
+            return;
+        }
+        // as a title's compute pipeline is made (`real::translated_compute_pso`: flags 0)
+        let disk = crate::hle::d3d12x::real::driver_cache::path(&c.dxil, 0);
+        if disk.as_deref().is_some_and(|p| p.is_file()) {
+            self.had.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let key: Vec<u32> = c.samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect();
         let rs = {
             let mut g = self.signatures.lock().unwrap();
@@ -797,8 +826,20 @@ impl Pipelines {
             }
             *n += 1;
         }
+        let started = std::time::Instant::now();
         let r: windows::core::Result<ID3D12PipelineState> = unsafe { self.dev.CreateComputePipelineState(&desc) };
+        let took = started.elapsed();
         *self.running.0.lock().unwrap() -= 1;
+        if let (Ok(pso), Some(p)) = (&r, disk.as_deref()) {
+            // the driver's compiled form, for a title's first bind of the same program
+            if let Ok(blob) = unsafe { pso.GetCachedBlob() } {
+                let bytes = unsafe { std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()) };
+                crate::hle::d3d12x::real::driver_cache::keep(p, bytes, took);
+                if p.is_file() {
+                    self.kept.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
         self.running.1.notify_one();
         drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
         let done = match r {
@@ -806,14 +847,20 @@ impl Pipelines {
             Err(_) => self.refused.fetch_add(1, Ordering::Relaxed) + 1,
         };
         if done % 25 == 0 {
-            eprintln!("  pipelines: {} made, {} refused", self.made.load(Ordering::Relaxed), self.refused.load(Ordering::Relaxed));
+            eprintln!(
+                "  pipelines: {} made, {} refused; driver blobs {} kept, {} kept already",
+                self.made.load(Ordering::Relaxed),
+                self.refused.load(Ordering::Relaxed),
+                self.kept.load(Ordering::Relaxed),
+                self.had.load(Ordering::Relaxed)
+            );
         }
     }
 }
 
-fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, t0: std::time::Instant) -> i32 {
-    let pipelines = if pipelines {
-        match Pipelines::new() {
+fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: Option<usize>, t0: std::time::Instant) -> i32 {
+    let pipelines = if let Some(min_dxil) = pipelines {
+        match Pipelines::new(min_dxil) {
             Ok(p) => Some(p),
             Err(e) => {
                 eprintln!("xcl shaders --pipelines: no GPU device: {e}");
@@ -933,7 +980,13 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
         t0.elapsed().as_secs_f64()
     );
     if let Some(p) = pipelines {
-        println!("pipelines made on the GPU {}, refused {}", p.made.load(Ordering::Relaxed), p.refused.load(Ordering::Relaxed));
+        println!(
+            "pipelines made on the GPU {}, refused {}; driver blobs kept for titles {} (already kept {})",
+            p.made.load(Ordering::Relaxed),
+            p.refused.load(Ordering::Relaxed),
+            p.kept.load(Ordering::Relaxed),
+            p.had.load(Ordering::Relaxed)
+        );
     }
     for e in errors.into_inner().unwrap() {
         println!("  {e}");
