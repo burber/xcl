@@ -14,6 +14,54 @@ DXIL cache filled beforehand with `xcl shaders --precompile` (22 800 / 26 503 pr
 | 2 | `e8c33a2` | 360 s | A at 30–130 s | first-boot settings (UI text size, subtitles) | 7 in the artwork intro, then 30 | clean, 8 887 frames |
 | 3 | `e8c33a2` | 600 s | A every 4 s from 120 s | legal notices (A alone cannot reach "Next") | 30 | clean, 16 106 frames |
 | 4 | `e8c33a2` | ~380 s | DOWN, DOWN, A every 6 s from 30 s | legal terms & policies (privacy policy / terms of service checkboxes) | 30 | stopped by hand before the agreement screen was answered |
+| 5 | `e8c33a2` | 368 s | as 4 until 147 s; terms ticked and confirmed at 175 s; A every 5 s | **world loading** (spinner, DirectStorage streaming 60–350 MB / 2 s) | 30 → ~1 → 0 | **title watchdog** `+0x23cf683` (null write via `+0x2215c35`) at 363 s |
+| 6 | `e8c33a2`, waits 1 ms | 347 s | as 5 (terms already saved) | world loading from ~150 s | 30 → mostly 0 | watchdog at 343 s, VRAM 14.4 GB |
+| 7 | `diag/list-101` | 215 s | as 6 | world loading | 30 → 0 | watchdog at 215 s, VRAM 13.7 GB |
+
+## Run 5: world loading and the watchdog
+
+- Terms confirmed → world loading from ~215 s. Local video memory climbs from 8.7 GB (224 s) past the
+  card's 12 GB (12.3 GB at 284 s; target pages 5.1 → 8.4 GB), commit 22 → 33 GB: the jump #560 describes.
+- 322.5 s: first call of `ID3D12GraphicsCommandList10::#101` (stub, not on PC). From here no
+  present, submit or draw until ~340 s (as in #505: the watchdog after the ListX #101 stub).
+- 342–364 s: #533's bounded compute waits fire: 14 × "still building after 4000 ms", **five of them
+  back to back on one thread** (30908: 347, 351, 355, 359, 364 s). Each wait is bounded, the
+  sum is not: that thread made no progress for 20 s+, on top of the 18 s gap before it.
+- 363.2 s: the title's watchdog.
+
+So on NVIDIA the per-pipeline bound of #533 is not enough by itself: consecutive first binds on one
+thread add up (the N × limit trade-off noted in #267).
+
+## Run 6: no pipeline waits — same watchdog
+
+`XCL_COMPUTE_PSO_WAIT_MS=1 XCL_PSO_WAIT_MS=1`. With the terms saved, world loading starts by ~150 s.
+Zero-present gaps remain (156–168, 176–186, 200–210, 228 s …) with no pipeline wait in them; local video
+memory 10 → 14.4 GB on the 12 GB card (target pages 9.8 GB), commit 26 → 42 GB. Watchdog at 343 s,
+~95 s after the first `#101`. Pipeline waits are not the only cause of the stall on this machine.
+
+## Run 7: what command list #101 takes (branch `diag/list-101`)
+
+A logging stand-in for the newer layout's #101 (answers 0 like the stub). Calls come in pairs on one list:
+
+```
+#101 call 1: 0x2 0x1 0x1 0xbf00011d 0x0
+#101 call 2: 0x2 0x0 0x0 0x0 0x0
+#101 call 5: 0x2 0x1 0xffffffff00000000 0x11d 0x0
+#101 call 6: 0x2 0x0 0x0 0x0 0x0
+```
+
+Only the first two arguments are stable: `2` (the compute list type's value) and on / off. The rest
+change from call to call (leftover registers). It writes no memory the title then waits on, so it is
+an unlikely source of the never-written counter #505 reports; a toggle answered 0 is probably
+harmless. First call at 90 s here (during loading, long before the stall). Watchdog at 215 s after
+~27 s without a present; local video memory 13.7 GB (target pages 9.6 GB) on the 12 GB card, 41 GB commit.
+
+## Where it stands
+
+Furthest point: world loading, about 2–4 min in. Every run that reaches the world ends at the title's
+watchdog after 20–30 s without a present, with local video memory 1.5–2.5 GB past the card. The likely
+causes on a 12 GB NVIDIA card are the video-memory jump at world start (#560, #320) together with slow
+first pipeline builds (#156, #533, #267). `#101` is not it.
 
 Notes
 - Second and later runs: the coherent window is the learned 4 095 MB (#284); the account prompt is
