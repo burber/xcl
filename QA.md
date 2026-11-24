@@ -27,6 +27,7 @@ DXIL cache filled beforehand with `xcl shaders --precompile` (22 800 / 26 503 pr
 
 | 15 | `exp/page-budget` (#708 + #640), `XCL_PAGE_BUDGET_MB=6144` | 130 s | as 6 | world loading from ~80 s | 30 → 0 | **video memory 10.3 GB (under the card)**, target pages 5.5 GB, 7 316 textures evicted, 42 mapped again; 0 `Wait64` timeouts; watchdog at 127 s with 10 compute pipelines "still building after 4000 ms" from 101 s |
 | 16 | same | 132 s | as 6 | world loading from ~75 s | 30 → 0 | 546 shader sets built ahead (run 15: 525); 13 compute pipelines still building at ~103 s; VRAM 10.4 GB; watchdog at 129 s |
+| 17 | `fa6e820` (pc-stack e915150 + #708 + #640), budget 6 GB, 99 driver blobs precompiled offline (`feat/precompile-driver-blobs`) | 148 s | as 6 | world loading from ~75 s | 30 → 0 | **32 compute pipelines from kept driver blobs**, 12 still building past 4 s (run 16: 13); VRAM 10.3 GB; watchdog at ~145 s (runs 15–16: ~128 s) |
 
 #708 removes the never-written-counter waits on this machine (runs 13–16; run 12 had them), and #640's
 budget keeps video memory under the 12 GB card (runs 15–16). What is left on an RTX 4070 Ti is the
@@ -93,3 +94,11 @@ Notes
 - No watchdog (`+0x2215c35`, #232) and no device removal in ~27 minutes of runs; no pipeline wait
   warnings from #533 / #267 yet (no world loading reached).
 - The window title reports `57 806 pipelines queued` (lazy pipelines, built at first use).
+
+## Precompiling the driver's blobs (branch `feat/precompile-driver-blobs`, same idea as #744)
+
+`xcl shaders <shaders.rpf> --precompile --only cs --pipelines --pipeline-min-kb 256` now keeps each
+build's driver blob where a title's compute pipeline looks for it (#634's `driver\`). Blobs the
+title wrote in earlier runs are found under the same names ("kept already"), so the DXIL matches.
+After 99 blobs (75 builds, ~25 per 6–10 min on the 4070 Ti), run 17 made 32 pipelines from them;
+the world's stalling programs were not among them yet, so the precompile is left to finish.
