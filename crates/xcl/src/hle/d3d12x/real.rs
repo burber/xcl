@@ -127,6 +127,10 @@ pub struct D3d12Stats {
     /// pipelines built in the background behind a stand-in: built, failed, still building
     #[serde(default)]
     pub background_pipelines: (usize, usize, usize),
+    /// draws that went with a stand-in (drew nothing) because their pipeline was not built
+    /// within `XCL_PSO_WAIT_MS` – lost, not replayed
+    #[serde(default)]
+    pub standin_draws: usize,
     /// DXIL cache and compiler statistics.
     #[serde(default)]
     pub dxil_cache: crate::gpu::recomp::dxc::CacheStats,
@@ -394,6 +398,7 @@ pub fn stats() -> D3d12Stats {
         translated_pipelines: TRANSLATED_PSO.load(Ordering::Relaxed),
         translation_errors: TRANSLATE_ERRORS.lock().map(|e| e.clone()).unwrap_or_default(),
         background_pipelines: super::pso_async::counts(),
+        standin_draws: super::pso_async::standin_draws(),
         dxil_cache: crate::gpu::recomp::dxc::cache_stats(),
     }
 }

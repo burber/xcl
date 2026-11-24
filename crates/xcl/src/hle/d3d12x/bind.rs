@@ -218,6 +218,12 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
     if !gfx && !compute {
+        // a PC pipeline (also a stand-in whose build is not done within the limit or failed):
+        // the title's root signature first, as in `graphics_bound` (nothing else binds it)
+        let rs = with(this, |s| s.rs_gfx) as *mut c_void;
+        if let (Some(list), Some(r)) = (ID3D12GraphicsCommandList::from_raw_borrowed(&this), ID3D12RootSignature::from_raw_borrowed(&rs)) {
+            list.SetGraphicsRootSignature(r);
+        }
         return pc(this, sig, max, args, args_off, count_buf, count_off);
     }
     if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
@@ -367,8 +373,9 @@ pub(super) unsafe fn emit_prepared_indexed_draw(
 unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList> {
     let list = ID3D12GraphicsCommandList::from_raw_borrowed(&this)?.clone();
     let pso = with(this, |s| s.pso);
-    // a pipeline still being built in the background is waited for (its stand-in draws nothing)
-    if !super::real::is_translated_graphics(super::pso_async::resolve_wait(pso)) {
+    // a pipeline still being built in the background is waited for (its stand-in draws
+    // nothing), within a limit: past it the title's thread goes on (`resolve_for_draw`)
+    if !super::real::is_translated_graphics(super::pso_async::resolve_for_draw(pso)) {
         count(DRAWS_PC);
         if super::present::trace_frame() {
             // which pipelines draw without a translation (first 12 distinct)
@@ -376,7 +383,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
             let mut g = SEEN.lock().unwrap();
             if !g.contains(&pso) && g.len() < 12 {
                 g.push(pso);
-                let real = super::pso_async::resolve_wait(pso);
+                let real = super::pso_async::resolve(pso);
                 crate::xlog_info!(
                     "frame trace: draw with an untranslated pipeline {pso:#x} (resolves to {real:#x}; pending {}, two-pass {}, RT0 {:?})",
                     super::pso_async::is_pending(pso),
@@ -1125,6 +1132,50 @@ mod tests {
         let _ = pso_async::released(standin_ok);
         let _ = pso_async::released(standin_fail);
         real::forget_pso_for_test(real_ok);
+    }
+
+    #[repr(C)]
+    struct OrderList {
+        vt: *const usize,
+        calls: Mutex<Vec<(&'static str, usize)>>,
+    }
+
+    unsafe extern "system" fn order_set_gfx_rs(this: *mut c_void, rs: *mut c_void) {
+        (*(this as *const OrderList)).calls.lock().unwrap().push(("SetGraphicsRootSignature", rs as usize));
+    }
+
+    unsafe extern "system" fn order_execute_indirect(this: *mut c_void, sig: usize, _max: u32, _args: usize, _args_off: u64, _count_buf: usize, _count_off: u64) {
+        (*(this as *const OrderList)).calls.lock().unwrap().push(("ExecuteIndirect", sig));
+    }
+
+    /// An indirect draw with a stand-in (its build not done within the limit, or failed) gets
+    /// the title's graphics root signature bound before it, as `graphics_bound` does for direct
+    /// draws: a draw without one is invalid (debug layer) and faults on WARP.
+    #[test]
+    fn execute_indirect_with_a_stand_in_binds_the_titles_root_signature_first() {
+        let mut orig_vt = [0usize; 64];
+        orig_vt[30] = order_set_gfx_rs as usize;
+        orig_vt[59] = order_execute_indirect as usize;
+        let mut ext_vt = vec![0usize; 65];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt);
+        // SAFETY: `ext_vt` has 65 elements so `.add(1)` points to slot 0 with `orig_vt` at `-1`.
+        let fake = Box::new(OrderList { vt: unsafe { ext_vt.as_ptr().add(1) }, calls: Mutex::new(Vec::new()) });
+        let list = &*fake as *const OrderList as *mut c_void;
+
+        // a graphics stand-in whose build failed: resolves to itself, not translated
+        let (standin, rs, sig) = (0x7500_0001usize, 0x7500_0010usize, 0x7500_00F0usize);
+        pso_async::submit(standin, false, Box::new(|| 0));
+        assert_eq!(pso_async::resolve_wait(standin), standin);
+        reset(list, 0x7500_0100, standin);
+        unsafe {
+            set_graphics_root_signature(list, rs as *mut c_void);
+            execute_indirect(list, sig, 1, 0, 0, 0, 0);
+        }
+        assert_eq!(*fake.calls.lock().unwrap(), vec![("SetGraphicsRootSignature", rs), ("ExecuteIndirect", sig)]);
+
+        forget(list);
+        let _ = pso_async::released(standin);
     }
 
     #[test]
